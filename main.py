@@ -1,9 +1,11 @@
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.responses import Response
 from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, Integer, Float, String
-from sqlalchemy.orm import declarative_base, sessionmaker
-import requests
+from sqlalchemy import Column, Integer, Float, String, select
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+from sqlalchemy.orm import declarative_base
+import httpx
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import os
 import uuid
 import logging
@@ -12,13 +14,13 @@ from prometheus_client import Counter, generate_latest, CONTENT_TYPE_LATEST
 
 app = FastAPI(title="Trip Service")
 
-DATABASE_URL = "sqlite:///./trip_service.db"
+DATABASE_URL = "sqlite+aiosqlite:///./trip_service.db"
 
 DRIVER_SERVICE_URL = os.getenv("DRIVER_SERVICE_URL", "http://127.0.0.1:8002")
 PAYMENT_SERVICE_URL = os.getenv("PAYMENT_SERVICE_URL", "http://127.0.0.1:8004")
 
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
-SessionLocal = sessionmaker(bind=engine)
+engine = create_async_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
 Base = declarative_base()
 
 trips_requested_total = Counter(
@@ -35,7 +37,6 @@ payments_failed_total = Counter(
     "payments_failed_total",
     "Total number of failed payments from Trip Service"
 )
-
 
 logger = logging.getLogger("trip-service")
 logger.setLevel(logging.INFO)
@@ -75,11 +76,62 @@ class TripRequest(BaseModel):
     surge_multiplier: float = 1.0
 
 
-Base.metadata.create_all(bind=engine)
+async def init_db():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+
+async def get_db():
+    async with SessionLocal() as session:
+        yield session
+
+
+@app.on_event("startup")
+async def startup_event():
+    await init_db()
 
 
 def get_correlation_id(request: Request):
     return request.headers.get("X-Correlation-ID", str(uuid.uuid4()))
+
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type((httpx.RequestError, httpx.HTTPStatusError))
+)
+async def fetch_available_driver(city: str, correlation_id: str):
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        response = await client.get(
+            f"{DRIVER_SERVICE_URL}/v1/drivers/available",
+            params={"city": city},
+            headers={"X-Correlation-ID": correlation_id}
+        )
+        response.raise_for_status()
+        return response.json()
+
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type((httpx.RequestError, httpx.HTTPStatusError))
+)
+async def process_payment(trip_id: int, amount: float, correlation_id: str, idempotency_key: str):
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        response = await client.post(
+            f"{PAYMENT_SERVICE_URL}/v1/payments/charge",
+            json={
+                "trip_id": trip_id,
+                "amount": amount,
+                "payment_method": "CARD"
+            },
+            headers={
+                "Idempotency-Key": idempotency_key,
+                "X-Correlation-ID": correlation_id
+            }
+        )
+        response.raise_for_status()
+        return response.json()
 
 
 @app.get("/health")
@@ -93,7 +145,7 @@ def metrics():
 
 
 @app.get("/v1/trips")
-def get_trips(request: Request):
+async def get_trips(request: Request, db: AsyncSession = Depends(get_db)):
     correlation_id = get_correlation_id(request)
 
     logger.info(
@@ -101,14 +153,12 @@ def get_trips(request: Request):
         extra={"correlation_id": correlation_id}
     )
 
-    db = SessionLocal()
-    trips = db.query(Trip).all()
-    db.close()
-    return trips
+    result = await db.execute(select(Trip))
+    return result.scalars().all()
 
 
 @app.get("/v1/trips/{trip_id}")
-def get_trip(trip_id: int, request: Request):
+async def get_trip(trip_id: int, request: Request, db: AsyncSession = Depends(get_db)):
     correlation_id = get_correlation_id(request)
 
     logger.info(
@@ -116,9 +166,8 @@ def get_trip(trip_id: int, request: Request):
         extra={"correlation_id": correlation_id}
     )
 
-    db = SessionLocal()
-    trip = db.query(Trip).filter(Trip.id == trip_id).first()
-    db.close()
+    result = await db.execute(select(Trip).filter(Trip.id == trip_id))
+    trip = result.scalars().first()
 
     if not trip:
         logger.error(
@@ -131,7 +180,7 @@ def get_trip(trip_id: int, request: Request):
 
 
 @app.post("/v1/trips")
-def create_trip(request_data: TripRequest, request: Request):
+async def create_trip(request_data: TripRequest, request: Request, db: AsyncSession = Depends(get_db)):
     correlation_id = get_correlation_id(request)
 
     logger.info(
@@ -150,14 +199,9 @@ def create_trip(request_data: TripRequest, request: Request):
         )
 
     try:
-        driver_response = requests.get(
-            f"{DRIVER_SERVICE_URL}/v1/drivers/available",
-            params={"city": request_data.city},
-            headers={"X-Correlation-ID": correlation_id},
-            timeout=5
-        )
-
-        if driver_response.status_code != 200:
+        driver = await fetch_available_driver(request_data.city, correlation_id)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
             logger.error(
                 "No active driver available",
                 extra={"correlation_id": correlation_id}
@@ -166,20 +210,16 @@ def create_trip(request_data: TripRequest, request: Request):
                 status_code=400,
                 detail="No active driver available"
             )
-
-        driver = driver_response.json()
-
-    except requests.exceptions.RequestException:
+        raise HTTPException(status_code=500, detail="Driver Service error")
+    except Exception as e:
         logger.error(
-            "Driver Service unavailable",
+            f"Driver Service unavailable: {e}",
             extra={"correlation_id": correlation_id}
         )
         raise HTTPException(
             status_code=500,
             detail="Driver Service is not available"
         )
-
-    db = SessionLocal()
 
     trip = Trip(
         rider_id=request_data.rider_id,
@@ -194,9 +234,8 @@ def create_trip(request_data: TripRequest, request: Request):
     )
 
     db.add(trip)
-    db.commit()
-    db.refresh(trip)
-    db.close()
+    await db.commit()
+    await db.refresh(trip)
 
     trips_requested_total.inc()
 
@@ -214,14 +253,13 @@ def create_trip(request_data: TripRequest, request: Request):
 
 
 @app.post("/v1/trips/{trip_id}/accept")
-def accept_trip(trip_id: int, request: Request):
+async def accept_trip(trip_id: int, request: Request, db: AsyncSession = Depends(get_db)):
     correlation_id = get_correlation_id(request)
 
-    db = SessionLocal()
-    trip = db.query(Trip).filter(Trip.id == trip_id).first()
+    result = await db.execute(select(Trip).filter(Trip.id == trip_id))
+    trip = result.scalars().first()
 
     if not trip:
-        db.close()
         logger.error(
             f"Trip {trip_id} not found",
             extra={"correlation_id": correlation_id}
@@ -229,7 +267,6 @@ def accept_trip(trip_id: int, request: Request):
         raise HTTPException(status_code=404, detail="Trip not found")
 
     if trip.status != "REQUESTED":
-        db.close()
         logger.error(
             f"Trip {trip_id} cannot be accepted from status {trip.status}",
             extra={"correlation_id": correlation_id}
@@ -241,9 +278,8 @@ def accept_trip(trip_id: int, request: Request):
 
     trip.status = "ACCEPTED"
 
-    db.commit()
-    db.refresh(trip)
-    db.close()
+    await db.commit()
+    await db.refresh(trip)
 
     logger.info(
         f"Trip {trip_id} accepted successfully",
@@ -258,14 +294,13 @@ def accept_trip(trip_id: int, request: Request):
 
 
 @app.post("/v1/trips/{trip_id}/complete")
-def complete_trip(trip_id: int, request: Request):
+async def complete_trip(trip_id: int, request: Request, db: AsyncSession = Depends(get_db)):
     correlation_id = get_correlation_id(request)
 
-    db = SessionLocal()
-    trip = db.query(Trip).filter(Trip.id == trip_id).first()
+    result = await db.execute(select(Trip).filter(Trip.id == trip_id))
+    trip = result.scalars().first()
 
     if not trip:
-        db.close()
         logger.error(
             f"Trip {trip_id} not found",
             extra={"correlation_id": correlation_id}
@@ -273,7 +308,6 @@ def complete_trip(trip_id: int, request: Request):
         raise HTTPException(status_code=404, detail="Trip not found")
 
     if trip.status != "ACCEPTED":
-        db.close()
         logger.error(
             f"Trip {trip_id} cannot be completed from status {trip.status}",
             extra={"correlation_id": correlation_id}
@@ -288,50 +322,19 @@ def complete_trip(trip_id: int, request: Request):
         trip.distance_km * rate_per_km * trip.surge_multiplier
     )
     trip.fare_amount = round(fare, 2)
-
     idempotency_key = f"trip-{trip.id}-payment"
 
     try:
-        payment_response = requests.post(
-            f"{PAYMENT_SERVICE_URL}/v1/payments/charge",
-            json={
-                "trip_id": trip.id,
-                "amount": trip.fare_amount,
-                "payment_method": "CARD"
-            },
-            headers={
-                "Idempotency-Key": idempotency_key,
-                "X-Correlation-ID": correlation_id
-            },
-            timeout=5
+        payment_result = await process_payment(
+            trip_id=trip.id,
+            amount=trip.fare_amount,
+            correlation_id=correlation_id,
+            idempotency_key=idempotency_key
         )
 
-        if payment_response.status_code != 200:
-            trip.status = "PAYMENT_FAILED"
-            db.commit()
-            db.refresh(trip)
-            db.close()
-
-            payments_failed_total.inc()
-
-            logger.error(
-                f"Payment failed for trip {trip_id}",
-                extra={"correlation_id": correlation_id}
-            )
-
-            return {
-                "message": "Trip completed but payment failed",
-                "correlation_id": correlation_id,
-                "trip": trip
-            }
-
         trip.status = "COMPLETED"
-
-        db.commit()
-        db.refresh(trip)
-
-        payment_result = payment_response.json()
-        db.close()
+        await db.commit()
+        await db.refresh(trip)
 
         trips_completed_total.inc()
 
@@ -347,55 +350,49 @@ def complete_trip(trip_id: int, request: Request):
             "payment_response": payment_result
         }
 
-    except requests.exceptions.RequestException:
+    except Exception as e:
         trip.status = "PAYMENT_FAILED"
-
-        db.commit()
-        db.refresh(trip)
-        db.close()
+        await db.commit()
+        await db.refresh(trip)
 
         payments_failed_total.inc()
 
         logger.error(
-            "Payment Service unavailable",
+            f"Payment Service unavailable or failed: {e}",
             extra={"correlation_id": correlation_id}
         )
 
         return {
-            "message": "Trip completed but Payment Service unavailable",
+            "message": "Trip completed but Payment Service failed",
             "correlation_id": correlation_id,
             "trip": trip
         }
 
 
 @app.post("/v1/trips/{trip_id}/cancel")
-def cancel_trip(trip_id: int, request: Request):
+async def cancel_trip(trip_id: int, request: Request, db: AsyncSession = Depends(get_db)):
     correlation_id = get_correlation_id(request)
 
-    db = SessionLocal()
-    trip = db.query(Trip).filter(Trip.id == trip_id).first()
+    result = await db.execute(select(Trip).filter(Trip.id == trip_id))
+    trip = result.scalars().first()
 
     if not trip:
-        db.close()
         raise HTTPException(status_code=404, detail="Trip not found")
 
     if trip.status == "COMPLETED":
-        db.close()
         raise HTTPException(
             status_code=400,
             detail="Completed trip cannot be cancelled"
         )
 
     cancellation_fee = 0
-
     if trip.status == "ACCEPTED":
         cancellation_fee = 30
 
     trip.status = "CANCELLED"
 
-    db.commit()
-    db.refresh(trip)
-    db.close()
+    await db.commit()
+    await db.refresh(trip)
 
     logger.info(
         f"Trip {trip_id} cancelled",
