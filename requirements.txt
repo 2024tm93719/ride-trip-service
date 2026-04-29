@@ -4,3 +4,4 @@ sqlalchemy
 pydantic
 requests
 pandas
+python-multipart
