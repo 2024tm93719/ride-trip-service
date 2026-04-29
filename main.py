@@ -9,8 +9,8 @@ app = FastAPI(title="Trip Service")
 
 DATABASE_URL = "sqlite:///./trip_service.db"
 
-DRIVER_SERVICE_URL = os.getenv("DRIVER_SERVICE_URL", "http://127.0.0.1:8002")
-PAYMENT_SERVICE_URL = os.getenv("PAYMENT_SERVICE_URL", "http://127.0.0.1:8004")
+DRIVER_SERVICE_URL = os.getenv("DRIVER_SERVICE_URL", "http://driver-service:8000")
+PAYMENT_SERVICE_URL = os.getenv("PAYMENT_SERVICE_URL", "http://payment-service:8000")
 
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(bind=engine)
