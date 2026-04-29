@@ -1,6 +1,9 @@
 fastapi
 uvicorn
 sqlalchemy
+aiosqlite
+httpx
+tenacity
 pydantic
 requests
 pandas
