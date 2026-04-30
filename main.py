@@ -76,6 +76,23 @@ class TripRequest(BaseModel):
     surge_multiplier: float = 1.0
 
 
+class TripResponse(BaseModel):
+    id: int
+    rider_id: int
+    driver_id: int | None
+    pickup_location: str
+    drop_location: str
+    city: str
+    distance_km: float
+    surge_multiplier: float
+    base_fare: float
+    fare_amount: float | None
+    status: str
+
+    class Config:
+        from_attributes = True
+
+
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -86,13 +103,19 @@ async def get_db():
         yield session
 
 
+@app.middleware("http")
+async def add_correlation_id(request: Request, call_next):
+    import uuid
+    correlation_id = request.headers.get("X-Correlation-ID", str(uuid.uuid4()))
+    request.state.correlation_id = correlation_id
+    response = await call_next(request)
+    response.headers["X-Correlation-ID"] = correlation_id
+    return response
+
+
 @app.on_event("startup")
 async def startup_event():
     await init_db()
-
-
-def get_correlation_id(request: Request):
-    return request.headers.get("X-Correlation-ID", str(uuid.uuid4()))
 
 
 @retry(
@@ -144,9 +167,9 @@ def metrics():
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
-@app.get("/v1/trips")
+@app.get("/v1/trips", response_model=list[TripResponse])
 async def get_trips(request: Request, db: AsyncSession = Depends(get_db)):
-    correlation_id = get_correlation_id(request)
+    correlation_id = request.state.correlation_id
 
     logger.info(
         "Fetching all trips",
@@ -157,9 +180,9 @@ async def get_trips(request: Request, db: AsyncSession = Depends(get_db)):
     return result.scalars().all()
 
 
-@app.get("/v1/trips/{trip_id}")
+@app.get("/v1/trips/{trip_id}", response_model=TripResponse)
 async def get_trip(trip_id: int, request: Request, db: AsyncSession = Depends(get_db)):
-    correlation_id = get_correlation_id(request)
+    correlation_id = request.state.correlation_id
 
     logger.info(
         f"Fetching trip {trip_id}",
@@ -181,7 +204,7 @@ async def get_trip(trip_id: int, request: Request, db: AsyncSession = Depends(ge
 
 @app.post("/v1/trips")
 async def create_trip(request_data: TripRequest, request: Request, db: AsyncSession = Depends(get_db)):
-    correlation_id = get_correlation_id(request)
+    correlation_id = request.state.correlation_id
 
     logger.info(
         "Trip request received",
@@ -254,7 +277,7 @@ async def create_trip(request_data: TripRequest, request: Request, db: AsyncSess
 
 @app.post("/v1/trips/{trip_id}/accept")
 async def accept_trip(trip_id: int, request: Request, db: AsyncSession = Depends(get_db)):
-    correlation_id = get_correlation_id(request)
+    correlation_id = request.state.correlation_id
 
     result = await db.execute(select(Trip).filter(Trip.id == trip_id))
     trip = result.scalars().first()
@@ -295,7 +318,7 @@ async def accept_trip(trip_id: int, request: Request, db: AsyncSession = Depends
 
 @app.post("/v1/trips/{trip_id}/complete")
 async def complete_trip(trip_id: int, request: Request, db: AsyncSession = Depends(get_db)):
-    correlation_id = get_correlation_id(request)
+    correlation_id = request.state.correlation_id
 
     result = await db.execute(select(Trip).filter(Trip.id == trip_id))
     trip = result.scalars().first()
@@ -371,7 +394,7 @@ async def complete_trip(trip_id: int, request: Request, db: AsyncSession = Depen
 
 @app.post("/v1/trips/{trip_id}/cancel")
 async def cancel_trip(trip_id: int, request: Request, db: AsyncSession = Depends(get_db)):
-    correlation_id = get_correlation_id(request)
+    correlation_id = request.state.correlation_id
 
     result = await db.execute(select(Trip).filter(Trip.id == trip_id))
     trip = result.scalars().first()
